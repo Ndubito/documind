@@ -1,0 +1,113 @@
+import json
+import logging
+import io
+import uuid
+import azure.functions as func
+from azure.appconfiguration.provider import load
+from azure.cosmos import CosmosClient
+from sentence_transformers import SentenceTransformer
+from azure.identity import DefaultAzureCredential
+from azure.monitor.opentelemetry import configure_azure_monitor
+from opentelemetry.sdk.resources import Resource
+from azure.storage.blob import BlobClient
+from pypdf import PdfReader
+
+# 1. Initialize global app instance
+app = func.FunctionApp()
+
+# 2. Global Initialization (Runs ONCE per container initialization)
+try:
+    credential = DefaultAzureCredential()
+    
+    # Load application configuration
+    config = load(
+        endpoint="https://documind-appconfig-nna2005.azconfig.io",
+        credential=credential
+    )
+    
+    # Configure Azure Monitor telemetry globally
+    configure_azure_monitor(
+        connection_string=config["DocuMind:AppInsightsConnectionString"],
+        resource=Resource.create({"service.name": "documind-func"}),
+    )
+    logging.info("Telemetry and App Configuration initialized successfully.")
+    
+   
+except Exception as e:
+    # Fallback log if initialization fails
+    logging.error(f"Global configuration/telemetry setup failed: {e}")
+    
+    
+#CosmosDb Inititalization
+try:
+    credential = DefaultAzureCredential()
+
+    client = CosmosClient("https://documind-cosmos-nna2005.documents.azure.com:443/",credential=credential)
+        
+    database = client.get_database_client("documind-db")
+    
+    container = database.get_container_client("documents-vector")
+    
+    model = SentenceTransformer('all-MiniLM-L6-v2')  # 384-dim, matches the policy above
+
+except Exception as e:
+     # Fallback log if initialization fails
+    logging.error(f"Cosmos configuration failed{e}")
+    
+    
+
+
+# 3. Function Trigger Handler
+@app.service_bus_queue_trigger(
+    arg_name="msg",
+    queue_name="document-processing",
+    connection="ServiceBusConnection"
+)
+
+def process_document(msg: func.ServiceBusMessage):
+    try:
+        # Secure decoding against payload errors
+        body = msg.get_body().decode('utf-8')
+        
+        logging.info(f"Auto-triggered, processing message: {body}")
+        
+        event = json.loads(body)
+        
+        blob_url = event['data']['url']
+        
+        file_name = blob_url.rsplit('/', 1)[1]   
+        
+        blob_client = BlobClient.from_blob_url(blob_url, credential=credential)
+        
+        blob_bytes = blob_client.download_blob().readall()
+        
+        pdf_reader = PdfReader(io.BytesIO(blob_bytes))
+
+        text = ""
+        
+        for page in pdf_reader.pages:
+            text += page.extract_text()
+        
+        new_id = str(uuid.uuid4())
+        
+        embedding = model.encode(text).tolist()
+        
+        user_id = "default-user"
+        
+        document = {
+            "id": new_id,
+            "userId": user_id,
+            "filename": file_name,
+            "text": text,
+            "embedding": embedding
+        }
+        
+        created_document = container.create_item(body=document)
+        logging.info(f"Document successfully embedded with ID: {created_document['id']}")
+        
+    except UnicodeDecodeError:
+        logging.error("Failed to decode message body. Format is not UTF-8.")
+        raise # Makes sure to stop execution and propagate the issue upwards so that the Service Bus can acknowledge that the message failed to complete
+    except Exception as e:
+        logging.error(f"Error executing document processing: {e}")
+        raise # Re-raise to allow Service Bus to handle retries/dead-lettering
