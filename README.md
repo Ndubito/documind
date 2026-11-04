@@ -112,7 +112,8 @@ sequenceDiagram
         C-->>F: stored id
         F-->>Q: Complete message
     end
-    Note over Q,F: On unhandled error, message is retried;<br/>after max delivery count it is dead-lettered.
+    Note over Q,F: On unhandled error the message is retried
+    Note over Q,F: After max delivery count it is dead-lettered
 ```
 
 ---
